@@ -1,0 +1,13 @@
+discord.py[voice]
+PyNaCl
+yt-dlp
+spotipy
+lyricsgenius
+python-dotenv
+requests
+cachetools
+psutil
+syncedlyrics
+playwright
+spotifyscraper[all]
+davey
