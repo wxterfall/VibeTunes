@@ -8,11 +8,11 @@ Contains: `discord.py` voice playback, `yt-dlp` extraction, FFmpeg streaming, Sp
 - `!play <query or link>` queues YouTube/SoundCloud/direct `yt-dlp` sources.
 - `!play <spotify url>` converts Spotify tracks, albums, playlists, or artist
   top tracks into playable searches.
-- `!pause`, `!resume`, `!skip`, `!stop`, `!queue`, `!now`, `!loop`, `!shuffle` and
-  `!volume`.
-- Embed responses and an interactive queue embed with pages.
+- `!pause`, `!resume`, `!skip`, `!stop`, `!disconnect`, `!queue`, `!now`,
+  `!loop`, `!shuffle` and `!volume`.
+- Embed responses throughout the bot, including an interactive paged queue.
 - `!lyrics [song]` uses Genius when `GENIUS_TOKEN` is configured.
-- `!syncedlyrics [song]` uses `syncedlyrics` for timestamped LRC lyrics.
+- `!syncedlyrics [song]` uses `syncedlyrics` package for timestamped LRC lyrics.
 
 
 ## Setup
@@ -33,6 +33,7 @@ COMMAND_PREFIX=!
 BOT_NAME=VibeTunes
 EMBED_COLOR=C026D3
 NOW_PLAYING_UPDATE_SECONDS=10
+IDLE_DISCONNECT_SECONDS=600
 SYNCED_LYRICS_ENABLED=true
 SYNCED_LYRICS_PROVIDERS=
 SYNCED_LYRICS_CONTEXT_LINES=1
@@ -64,6 +65,7 @@ python bot.py
 | `!pause` / `!resume` | Pause or resume playback. |
 | `!skip` | Skip the current song. |
 | `!stop` | Clear the queue and leave voice. |
+| `!disconnect` | Leave voice and clear the queue. |
 | `!queue` | Show the current queue with Previous/Next buttons. |
 | `!now` | Show the current song with an updating timeline. |
 | `!loop` | Toggle repeat for the current song. |
@@ -77,6 +79,8 @@ Spotify links do not play audio directly.
 The bot uses Spotify metadata to search for an equivalent playable source, which is the same practical approach many Discord music bots use.
 
 Use `!syncedlyrics` while music is playing to open a separate updating synced-lyrics embed. Leave `SYNCED_LYRICS_PROVIDERS` blank to let `syncedlyrics` try its default providers, or set a comma-separated list such as `Lrclib,NetEase`. If lyrics are consistently early or late, tune `SYNCED_LYRICS_OFFSET_SECONDS`.
+
+The bot automatically disconnects after `IDLE_DISCONNECT_SECONDS` of inactivity when it is connected to voice with nothing playing and nothing queued. Set it to `0` to disable the idle disconnect timer.
 
 YouTube and other extractors can change or rate-limit over time. 
 Self-hosting is more reliable than running a large public bot.

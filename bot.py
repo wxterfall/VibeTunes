@@ -34,6 +34,7 @@ MAX_SPOTIFY_TRACKS = int(os.getenv("MAX_SPOTIFY_TRACKS", "200"))
 BOT_NAME = os.getenv("BOT_NAME", "VibeTunes").strip() or "VibeTunes"
 QUEUE_PAGE_SIZE = 10
 NOW_PLAYING_UPDATE_SECONDS = int(os.getenv("NOW_PLAYING_UPDATE_SECONDS", "1"))
+IDLE_DISCONNECT_SECONDS = int(os.getenv("IDLE_DISCONNECT_SECONDS", "600"))
 SYNCED_LYRICS_ENABLED = os.getenv("SYNCED_LYRICS_ENABLED", "true").lower() not in {
     "0",
     "false",
@@ -151,6 +152,7 @@ class QueueItem:
     query: str
     title: str
     requester: str
+    requester_avatar_url: str | None = None
     artist: str | None = None
     webpage_url: str | None = None
     info: dict[str, Any] | None = None
@@ -176,6 +178,7 @@ class Track:
     duration: int | None
     requester: str
     source_item: QueueItem
+    requester_avatar_url: str | None = None
     artist: str | None = None
     thumbnail: str | None = None
     uploader: str | None = None
@@ -200,6 +203,7 @@ class GuildPlayer:
         self.progress_task: asyncio.Task | None = None
         self.synced_lyrics_message: discord.Message | None = None
         self.synced_lyrics_task: asyncio.Task | None = None
+        self.idle_disconnect_task: asyncio.Task | None = None
         self.playback_started_at: float | None = None
         self.paused_started_at: float | None = None
         self.total_paused_seconds = 0.0
@@ -533,6 +537,16 @@ def build_track_added_embed(
     return embed
 
 
+def set_track_requester_footer(embed: discord.Embed, track: Track) -> None:
+    if track.requester_avatar_url:
+        embed.set_footer(
+            text=f"Requested by {track.requester}",
+            icon_url=track.requester_avatar_url,
+        )
+    else:
+        embed.set_footer(text=f"Requested by {track.requester}")
+
+
 def cancel_progress_task(player: GuildPlayer) -> None:
     if player.progress_task and not player.progress_task.done():
         player.progress_task.cancel()
@@ -543,6 +557,12 @@ def cancel_synced_lyrics_task(player: GuildPlayer) -> None:
     if player.synced_lyrics_task and not player.synced_lyrics_task.done():
         player.synced_lyrics_task.cancel()
     player.synced_lyrics_task = None
+
+
+def cancel_idle_disconnect_task(player: GuildPlayer) -> None:
+    if player.idle_disconnect_task and not player.idle_disconnect_task.done():
+        player.idle_disconnect_task.cancel()
+    player.idle_disconnect_task = None
 
 
 def remember_now_playing_message(player: GuildPlayer, message: discord.Message) -> None:
@@ -558,6 +578,7 @@ def remember_now_playing_message(player: GuildPlayer, message: discord.Message) 
 def reset_progress_state(player: GuildPlayer) -> None:
     cancel_progress_task(player)
     cancel_synced_lyrics_task(player)
+    cancel_idle_disconnect_task(player)
     player.now_playing_message = None
     player.now_playing_messages.clear()
     player.synced_lyrics_message = None
@@ -650,7 +671,7 @@ def build_now_playing_embed(player: GuildPlayer, track: Track) -> discord.Embed:
         f"{progress_bar(int(elapsed), track.duration)}",
         color=PRIMARY_COLOR,
     )
-    embed.set_footer(text=f"Requested by {track.requester}")
+    set_track_requester_footer(embed, track)
     if track.thumbnail:
         embed.set_thumbnail(url=track.thumbnail)
     return embed
@@ -669,7 +690,7 @@ def build_synced_lyrics_embed(player: GuildPlayer, track: Track) -> discord.Embe
         color=PRIMARY_COLOR,
     )
     embed.add_field(name="Lyrics", value=lyrics, inline=False)
-    embed.set_footer(text=f"Requested by {track.requester}")
+    set_track_requester_footer(embed, track)
     if track.thumbnail:
         embed.set_thumbnail(url=track.thumbnail)
     return embed
@@ -801,6 +822,65 @@ async def send_embed(
         logger.warning("Missing permission to send a message.")
 
 
+def player_is_idle(player: GuildPlayer) -> bool:
+    voice_client = player.voice_client
+    return bool(
+        voice_client
+        and voice_client.is_connected()
+        and not voice_client.is_playing()
+        and not voice_client.is_paused()
+        and player.current is None
+        and not player.queue
+        and not player.playback_active
+    )
+
+
+async def idle_disconnect_after(guild_id: int) -> None:
+    try:
+        await asyncio.sleep(IDLE_DISCONNECT_SECONDS)
+        player = player_for(guild_id)
+        voice_client = player.voice_client
+        if not player_is_idle(player) or not voice_client:
+            return
+
+        old_now_playing_messages: list[discord.Message] = []
+        async with player.lock:
+            voice_client = player.voice_client
+            if not player_is_idle(player) or not voice_client:
+                return
+            player.voice_client = None
+            player.loop_current = False
+            old_now_playing_messages = detach_now_playing_messages(player)
+
+        await delete_messages(old_now_playing_messages)
+        try:
+            if voice_client.is_connected():
+                await voice_client.disconnect(force=True)
+        except discord.HTTPException as exc:
+            logger.warning("Could not auto-disconnect idle voice client: %s", exc)
+
+        await send_embed(
+            player.text_channel,
+            "Disconnected",
+            f"Left voice after {duration_text(IDLE_DISCONNECT_SECONDS)} of inactivity.",
+            color=SUCCESS_COLOR,
+        )
+    except asyncio.CancelledError:
+        return
+    finally:
+        player = player_for(guild_id)
+        if player.idle_disconnect_task is asyncio.current_task():
+            player.idle_disconnect_task = None
+
+
+def start_idle_disconnect_task(guild_id: int) -> None:
+    player = player_for(guild_id)
+    cancel_idle_disconnect_task(player)
+    if IDLE_DISCONNECT_SECONDS <= 0 or not player_is_idle(player):
+        return
+    player.idle_disconnect_task = asyncio.create_task(idle_disconnect_after(guild_id))
+
+
 class QueueView(discord.ui.View):
     def __init__(self, player: GuildPlayer, requester: discord.abc.User) -> None:
         super().__init__(timeout=120)
@@ -927,7 +1007,11 @@ async def ytdl_extract(query: str, *, flat: bool = False) -> dict[str, Any]:
     return await asyncio.to_thread(ytdl_extract_sync, query, flat=flat)
 
 
-def spotify_track_to_item(track: dict[str, Any], requester: str) -> QueueItem | None:
+def spotify_track_to_item(
+    track: dict[str, Any],
+    requester: str,
+    requester_avatar_url: str | None,
+) -> QueueItem | None:
     title = track.get("name")
     artists = ", ".join(artist["name"] for artist in track.get("artists", []))
     if not title or not artists:
@@ -952,13 +1036,18 @@ def spotify_track_to_item(track: dict[str, Any], requester: str) -> QueueItem | 
         query=f"ytsearch1:{sanitize_query(title + ' ' + artists)}",
         title=title,
         requester=requester,
+        requester_avatar_url=requester_avatar_url,
         artist=artists,
         webpage_url=track.get("external_urls", {}).get("spotify"),
         info=info or None,
     )
 
 
-def spotify_items_sync(url: str, requester: str) -> list[QueueItem]:
+def spotify_items_sync(
+    url: str,
+    requester: str,
+    requester_avatar_url: str | None,
+) -> list[QueueItem]:
     if spotify_client is None:
         raise RuntimeError(
             "Spotify support needs SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET."
@@ -969,14 +1058,14 @@ def spotify_items_sync(url: str, requester: str) -> list[QueueItem]:
 
     if "/track/" in clean_url:
         track = spotify_client.track(clean_url)
-        item = spotify_track_to_item(track, requester)
+        item = spotify_track_to_item(track, requester, requester_avatar_url)
         return [item] if item else []
 
     if "/album/" in clean_url:
         page = spotify_client.album_tracks(clean_url, limit=50)
         while page and len(items) < MAX_SPOTIFY_TRACKS:
             for track in page.get("items", []):
-                item = spotify_track_to_item(track, requester)
+                item = spotify_track_to_item(track, requester, requester_avatar_url)
                 if item:
                     items.append(item)
                 if len(items) >= MAX_SPOTIFY_TRACKS:
@@ -995,7 +1084,7 @@ def spotify_items_sync(url: str, requester: str) -> list[QueueItem]:
                 track = entry.get("track")
                 if not track:
                     continue
-                item = spotify_track_to_item(track, requester)
+                item = spotify_track_to_item(track, requester, requester_avatar_url)
                 if item:
                     items.append(item)
                 if len(items) >= MAX_SPOTIFY_TRACKS:
@@ -1006,7 +1095,7 @@ def spotify_items_sync(url: str, requester: str) -> list[QueueItem]:
     if "/artist/" in clean_url:
         top_tracks = spotify_client.artist_top_tracks(clean_url)
         for track in top_tracks.get("tracks", []):
-            item = spotify_track_to_item(track, requester)
+            item = spotify_track_to_item(track, requester, requester_avatar_url)
             if item:
                 items.append(item)
         return items
@@ -1014,11 +1103,24 @@ def spotify_items_sync(url: str, requester: str) -> list[QueueItem]:
     raise RuntimeError("That Spotify URL type is not supported yet.")
 
 
-async def spotify_items(url: str, requester: str) -> list[QueueItem]:
-    return await asyncio.to_thread(spotify_items_sync, url, requester)
+async def spotify_items(
+    url: str,
+    requester: str,
+    requester_avatar_url: str | None,
+) -> list[QueueItem]:
+    return await asyncio.to_thread(
+        spotify_items_sync,
+        url,
+        requester,
+        requester_avatar_url,
+    )
 
 
-def entry_to_queue_item(entry: dict[str, Any], requester: str) -> QueueItem | None:
+def entry_to_queue_item(
+    entry: dict[str, Any],
+    requester: str,
+    requester_avatar_url: str | None,
+) -> QueueItem | None:
     title = entry.get("title") or "Queued track"
     artist = entry.get("artist")
     webpage_url = entry.get("webpage_url")
@@ -1031,16 +1133,21 @@ def entry_to_queue_item(entry: dict[str, Any], requester: str) -> QueueItem | No
         query=query,
         title=title,
         requester=requester,
+        requester_avatar_url=requester_avatar_url,
         artist=artist,
         webpage_url=webpage_url,
         info=info,
     )
 
 
-async def build_queue_items(query: str, requester: str) -> list[QueueItem]:
+async def build_queue_items(
+    query: str,
+    requester: str,
+    requester_avatar_url: str | None,
+) -> list[QueueItem]:
     query = sanitize_query(query)
     if is_spotify_url(query):
-        return await spotify_items(query, requester)
+        return await spotify_items(query, requester, requester_avatar_url)
 
     lookup = query if is_url(query) else f"ytsearch1:{query}"
     info = await ytdl_extract(lookup, flat=is_url(query))
@@ -1050,11 +1157,12 @@ async def build_queue_items(query: str, requester: str) -> list[QueueItem]:
         items = [
             item
             for entry in entries
-            if entry and (item := entry_to_queue_item(entry, requester))
+            if entry
+            and (item := entry_to_queue_item(entry, requester, requester_avatar_url))
         ]
         return items
 
-    item = entry_to_queue_item(info, requester)
+    item = entry_to_queue_item(info, requester, requester_avatar_url)
     return [item] if item else []
 
 
@@ -1077,6 +1185,7 @@ async def resolve_queue_item(item: QueueItem) -> Track:
         webpage_url=info.get("webpage_url") or item.webpage_url,
         duration=info.get("duration"),
         requester=item.requester,
+        requester_avatar_url=item.requester_avatar_url,
         artist=artist,
         thumbnail=info.get("thumbnail"),
         uploader=info.get("uploader") or info.get("channel"),
@@ -1084,6 +1193,7 @@ async def resolve_queue_item(item: QueueItem) -> Track:
             query=item.query,
             title=item.title,
             requester=item.requester,
+            requester_avatar_url=item.requester_avatar_url,
             artist=item.artist,
             webpage_url=item.webpage_url,
             info=None,
@@ -1123,6 +1233,7 @@ async def ensure_voice(ctx: commands.Context) -> discord.VoiceClient | None:
 
     player.voice_client = voice_client
     player.text_channel = ctx.channel
+    start_idle_disconnect_task(ctx.guild.id)
     return voice_client
 
 
@@ -1175,6 +1286,7 @@ async def play_next(guild_id: int) -> None:
         if not player.voice_client or not player.voice_client.is_connected():
             player.playback_active = False
             player.current = None
+            cancel_idle_disconnect_task(player)
             old_now_playing_messages = detach_now_playing_messages(player)
 
         elif not player.queue:
@@ -1196,10 +1308,13 @@ async def play_next(guild_id: int) -> None:
             "There are no more tracks waiting.",
             color=SUCCESS_COLOR,
         )
+        start_idle_disconnect_task(guild_id)
         return
 
     if item is None:
         return
+
+    cancel_idle_disconnect_task(player)
 
     try:
         track = await resolve_queue_item(item)
@@ -1233,6 +1348,7 @@ async def play_next(guild_id: int) -> None:
 
         else:
             player.current = track
+            cancel_idle_disconnect_task(player)
             player.playback_started_at = time.monotonic()
             player.paused_started_at = None
             player.total_paused_seconds = 0.0
@@ -1277,6 +1393,7 @@ async def help_command(ctx: commands.Context) -> None:
             f"`{prefix}pause` / `{prefix}resume` - control playback\n"
             f"`{prefix}skip` - skip the current song\n"
             f"`{prefix}stop` - clear the queue and leave voice\n"
+            f"`{prefix}disconnect` - leave voice\n"
             f"`{prefix}queue` - show the queue\n"
             f"`{prefix}shuffle` - shuffle the remaining queue\n"
             f"`{prefix}now` - show the current song\n"
@@ -1319,9 +1436,16 @@ async def play(ctx: commands.Context, *, query: str | None = None) -> None:
     if not voice_client:
         return
 
+    player = player_for(ctx.guild.id)
+    cancel_idle_disconnect_task(player)
+
     async with ctx.typing():
         try:
-            items = await build_queue_items(query, requester=ctx.author.display_name)
+            items = await build_queue_items(
+                query,
+                requester=ctx.author.display_name,
+                requester_avatar_url=ctx.author.display_avatar.url,
+            )
         except Exception as exc:
             logger.exception("Could not build queue items for %s", query)
             await reply_embed(
@@ -1343,7 +1467,6 @@ async def play(ctx: commands.Context, *, query: str | None = None) -> None:
         )
         return
 
-    player = player_for(ctx.guild.id)
     player.queue.extend(items)
 
     if len(items) == 1:
@@ -1444,20 +1567,28 @@ async def skip(ctx: commands.Context) -> None:
         )
 
 
-@bot.command(name="stop", aliases=["leave", "disconnect"])
-async def stop(ctx: commands.Context) -> None:
+async def clear_music_state_and_disconnect(
+    ctx: commands.Context,
+    *,
+    success_title: str,
+    success_description: str,
+    empty_title: str,
+    empty_description: str,
+) -> None:
     if not ctx.guild:
         return
 
     player = player_for(ctx.guild.id)
-    voice_client = ctx.guild.voice_client
+    voice_client = ctx.guild.voice_client or player.voice_client
+    voice_connected = bool(voice_client and voice_client.is_connected())
     voice_active = bool(
         voice_client
-        and voice_client.is_connected()
+        and voice_connected
         and (voice_client.is_playing() or voice_client.is_paused())
     )
     has_music_state = (
-        voice_active
+        voice_connected
+        or voice_active
         or player.current is not None
         or bool(player.queue)
         or player.playback_active
@@ -1466,37 +1597,64 @@ async def stop(ctx: commands.Context) -> None:
     if not has_music_state:
         await reply_embed(
             ctx,
-            "Already stopped",
-            f"The music is already stopped. Use `{COMMAND_PREFIX}play <song>` to start something.",
+            empty_title,
+            empty_description,
             color=WARNING_COLOR,
             requester=ctx.author,
         )
         return
 
+    cancel_idle_disconnect_task(player)
     player.queue.clear()
-    player.manual_stop = True
+    player.manual_stop = voice_active
     player.loop_current = False
+    player.skip_requested = False
 
     if voice_client:
         if voice_client.is_playing() or voice_client.is_paused():
             voice_client.stop()
-        await voice_client.disconnect(force=True)
+        if voice_client.is_connected():
+            await voice_client.disconnect(force=True)
 
     old_now_playing_messages: list[discord.Message] = []
     async with player.lock:
         player.playback_active = False
         player.current = None
         player.voice_client = None
+        if not voice_active:
+            player.manual_stop = False
         old_now_playing_messages = detach_now_playing_messages(player)
 
     await delete_messages(old_now_playing_messages)
 
     await reply_embed(
         ctx,
-        "Stopped",
-        "Stopped the music and cleared the queue!",
+        success_title,
+        success_description,
         color=SUCCESS_COLOR,
         requester=ctx.author,
+    )
+
+
+@bot.command(name="stop")
+async def stop(ctx: commands.Context) -> None:
+    await clear_music_state_and_disconnect(
+        ctx,
+        success_title="Stopped",
+        success_description="Stopped the music and cleared the queue!",
+        empty_title="Already stopped",
+        empty_description=f"The music is already stopped. Use `{COMMAND_PREFIX}play <song>` to start something.",
+    )
+
+
+@bot.command(name="disconnect", aliases=["dc", "leave"])
+async def disconnect(ctx: commands.Context) -> None:
+    await clear_music_state_and_disconnect(
+        ctx,
+        success_title="Disconnected",
+        success_description="Disconnected from voice and cleared the queue.",
+        empty_title="Already disconnected",
+        empty_description="I'm not connected to a voice channel.",
     )
 
 
