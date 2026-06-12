@@ -1,16 +1,16 @@
-# Simple Python Music Bot
+# VibeTunes, a simple Python Music Bot
 
 A simple Discord music bot with text commands only.
-It keeps the useful music mechanics from modern Python Discord bots: `discord.py` voice playback, `yt-dlp` extraction, FFmpeg streaming, Spotify-to-search conversion through the Spotify developer API, and Genius lyrics.
+Contains: `discord.py` voice playback, `yt-dlp` extraction, FFmpeg streaming, Spotify-to-search conversion through the Spotify developer API, and Genius lyrics.
 
 ## Features
 
-- `!play <url or search>` queues YouTube/SoundCloud/direct `yt-dlp` sources.
+- `!play <query or link>` queues YouTube/SoundCloud/direct `yt-dlp` sources.
 - `!play <spotify url>` converts Spotify tracks, albums, playlists, or artist
   top tracks into playable searches.
-- `!pause`, `!resume`, `!skip`, `!stop`, `!queue`, `!now`, `!loop`, and
+- `!pause`, `!resume`, `!skip`, `!stop`, `!queue`, `!now`, `!loop`, `!shuffle` and
   `!volume`.
-- Embed responses throughout the bot, including an interactive paged queue.
+- Embed responses and an interactive queue embed with pages.
 - `!lyrics [song]` uses Genius when `GENIUS_TOKEN` is configured.
 - `!syncedlyrics [song]` uses `syncedlyrics` for timestamped LRC lyrics.
 
