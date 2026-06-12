@@ -2,18 +2,22 @@ from __future__ import annotations
 
 import asyncio
 import bisect
+import json
 import logging
 import os
 import random
 import re
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass
+from html import unescape
 from typing import Any, Deque
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import discord
 import lyricsgenius
+import requests
 import spotipy
 import yt_dlp
 from discord.ext import commands
@@ -228,9 +232,244 @@ def is_spotify_url(value: str) -> bool:
     return "spotify.com" in host or host == "spotify.link"
 
 
+def is_soundcloud_url(value: str) -> bool:
+    host = urlparse(value).netloc.lower()
+    return "soundcloud.com" in host or host == "on.soundcloud.com"
+
+
+def should_flat_extract_url(value: str) -> bool:
+    if not is_url(value):
+        return False
+    if is_soundcloud_url(value):
+        return False
+    return True
+
+
+def is_deezer_url(value: str) -> bool:
+    host = urlparse(value).netloc.lower()
+    return "deezer.com" in host or host == "deezer.page.link"
+
+
+def is_apple_music_url(value: str) -> bool:
+    host = urlparse(value).netloc.lower()
+    return host == "music.apple.com" or host.endswith(".music.apple.com")
+
+
+def is_tidal_url(value: str) -> bool:
+    host = urlparse(value).netloc.lower()
+    return host == "tidal.com" or host.endswith(".tidal.com")
+
+
+def is_amazon_music_url(value: str) -> bool:
+    host = urlparse(value).netloc.lower()
+    return host == "music.amazon.com" or (
+        host.startswith("music.amazon.") and len(host) > len("music.amazon.")
+    )
+
+
+def is_metadata_resolver_url(value: str) -> bool:
+    return (
+        is_deezer_url(value)
+        or is_apple_music_url(value)
+        or is_tidal_url(value)
+        or is_amazon_music_url(value)
+    )
+
+
 def sanitize_query(query: str) -> str:
     query = re.sub(r"[\x00-\x1F\x7F]", "", query)
     return re.sub(r"\s+", " ", query).strip()
+
+
+REQUEST_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/137.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Sec-Ch-Ua": '"Google Chrome";v="137", "Chromium";v="137", "Not/A)Brand";v="24"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+}
+
+
+def metadata_to_queue_item(
+    *,
+    title: str,
+    artist: str | None,
+    requester: str,
+    requester_avatar_url: str | None,
+    webpage_url: str | None,
+    duration: int | float | None = None,
+    thumbnail: str | None = None,
+) -> QueueItem | None:
+    title = sanitize_query(title)
+    artist = sanitize_query(artist or "")
+    if not title:
+        return None
+
+    search_text = sanitize_query(f"{title} {artist}".strip())
+    info = {
+        key: value
+        for key, value in {
+            "duration": int(duration) if duration is not None else None,
+            "thumbnail": thumbnail,
+        }.items()
+        if value is not None
+    }
+    return QueueItem(
+        query=f"ytsearch1:{search_text}",
+        title=title,
+        requester=requester,
+        requester_avatar_url=requester_avatar_url,
+        artist=artist or None,
+        webpage_url=webpage_url,
+        info=info or None,
+    )
+
+
+def parse_duration_value(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    if not isinstance(value, str):
+        return None
+
+    value = value.strip()
+    if not value:
+        return None
+    if value.isdigit():
+        return int(value)
+
+    parts = value.split(":")
+    if not all(part.isdigit() for part in parts):
+        return None
+
+    seconds = 0
+    for part in parts:
+        seconds = seconds * 60 + int(part)
+    return seconds
+
+
+def http_get_json(url: str, *, params: dict[str, Any] | None = None) -> Any:
+    response = requests.get(
+        url,
+        params=params,
+        headers=REQUEST_HEADERS,
+        timeout=15,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def http_get_response(url: str) -> requests.Response:
+    response = requests.get(
+        url,
+        headers=REQUEST_HEADERS,
+        timeout=15,
+        allow_redirects=True,
+    )
+    response.raise_for_status()
+    return response
+
+
+def http_get_text(url: str) -> str:
+    return http_get_response(url).text
+
+
+def first_meta_content(html: str, *keys: str) -> str | None:
+    wanted = {key.lower() for key in keys}
+    for tag in re.findall(r"<meta\b[^>]*>", html, flags=re.IGNORECASE):
+        attrs = {
+            name.lower(): unescape(value.strip())
+            for name, value in re.findall(
+                r'([\w:-]+)\s*=\s*["\']([^"\']*)["\']',
+                tag,
+                flags=re.IGNORECASE,
+            )
+        }
+        key = (attrs.get("property") or attrs.get("name") or "").lower()
+        content = attrs.get("content")
+        if key in wanted and content:
+            return content
+    return None
+
+
+def first_html_title(html: str) -> str | None:
+    match = re.search(r"<title[^>]*>(.*?)</title>", html, flags=re.IGNORECASE | re.S)
+    if not match:
+        return None
+    return sanitize_query(unescape(re.sub(r"\s+", " ", match.group(1))))
+
+
+def iter_json_ld(html: str) -> list[Any]:
+    values: list[Any] = []
+    for match in re.finditer(
+        r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+        html,
+        flags=re.IGNORECASE | re.S,
+    ):
+        raw_json = unescape(match.group(1)).strip()
+        if not raw_json:
+            continue
+        try:
+            values.append(json.loads(raw_json))
+        except json.JSONDecodeError:
+            continue
+    return values
+
+
+def flatten_json_ld(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, dict):
+        items = [value]
+        graph = value.get("@graph")
+        if isinstance(graph, list):
+            for entry in graph:
+                items.extend(flatten_json_ld(entry))
+        return items
+    if isinstance(value, list):
+        items: list[dict[str, Any]] = []
+        for entry in value:
+            items.extend(flatten_json_ld(entry))
+        return items
+    return []
+
+
+def json_ld_text(value: Any) -> str | None:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for key in ("name", "alternateName"):
+            if value.get(key):
+                return str(value[key])
+    if isinstance(value, list) and value:
+        return json_ld_text(value[0])
+    return None
+
+
+def clean_provider_title(title: str, provider: str) -> str:
+    title = sanitize_query(title)
+    title = re.sub(
+        rf"\s*(?:\||-|on)\s*{re.escape(provider)}(?:\s+Music)?\s*$",
+        "",
+        title,
+        flags=re.IGNORECASE,
+    )
+    title = re.sub(r"\s*\|\s*Amazon Music\s*$", "", title, flags=re.IGNORECASE)
+    title = re.sub(r"\s*-\s*Amazon Music\s*$", "", title, flags=re.IGNORECASE)
+    return sanitize_query(title)
+
+
+def split_title_artist_from_page(title: str, provider: str) -> tuple[str, str | None]:
+    title = clean_provider_title(title, provider)
+    if " by " in title:
+        song, artist = title.split(" by ", 1)
+        if song.strip() and artist.strip():
+            return sanitize_query(song), sanitize_query(artist)
+    return title, None
 
 
 def duration_text(seconds: int | None) -> str:
@@ -1019,27 +1258,18 @@ def spotify_track_to_item(
 
     images = track.get("album", {}).get("images", [])
     thumbnail = images[0]["url"] if images else None
-    info = {
-        key: value
-        for key, value in {
-            "duration": (
-                int(track["duration_ms"]) / 1000
-                if track.get("duration_ms") is not None
-                else None
-            ),
-            "thumbnail": thumbnail,
-        }.items()
-        if value is not None
-    }
-
-    return QueueItem(
-        query=f"ytsearch1:{sanitize_query(title + ' ' + artists)}",
+    return metadata_to_queue_item(
         title=title,
         requester=requester,
         requester_avatar_url=requester_avatar_url,
         artist=artists,
         webpage_url=track.get("external_urls", {}).get("spotify"),
-        info=info or None,
+        duration=(
+            int(track["duration_ms"]) / 1000
+            if track.get("duration_ms") is not None
+            else None
+        ),
+        thumbnail=thumbnail,
     )
 
 
@@ -1116,6 +1346,709 @@ async def spotify_items(
     )
 
 
+def deezer_track_to_item(
+    track: dict[str, Any],
+    requester: str,
+    requester_avatar_url: str | None,
+    *,
+    fallback_thumbnail: str | None = None,
+) -> QueueItem | None:
+    artist = track.get("artist")
+    album = track.get("album")
+    return metadata_to_queue_item(
+        title=track.get("title") or track.get("title_short") or "",
+        artist=artist.get("name") if isinstance(artist, dict) else None,
+        requester=requester,
+        requester_avatar_url=requester_avatar_url,
+        webpage_url=track.get("link"),
+        duration=track.get("duration"),
+        thumbnail=(
+            (album.get("cover_medium") if isinstance(album, dict) else None)
+            or fallback_thumbnail
+        ),
+    )
+
+
+def deezer_items_sync(
+    url: str,
+    requester: str,
+    requester_avatar_url: str | None,
+) -> list[QueueItem]:
+    response = requests.get(
+        url,
+        headers=REQUEST_HEADERS,
+        timeout=15,
+        allow_redirects=True,
+    )
+    response.raise_for_status()
+    clean_url = response.url
+    match = re.search(r"/(track|album|playlist|artist)/(\d+)", clean_url)
+    if not match:
+        raise RuntimeError("That Deezer URL type is not supported yet.")
+
+    kind, deezer_id = match.groups()
+    if kind == "track":
+        data = http_get_json(f"https://api.deezer.com/track/{deezer_id}")
+        item = deezer_track_to_item(data, requester, requester_avatar_url)
+        return [item] if item else []
+
+    if kind in {"album", "playlist"}:
+        data = http_get_json(f"https://api.deezer.com/{kind}/{deezer_id}")
+        tracks = data.get("tracks", {}).get("data", [])
+        thumbnail = data.get("cover_medium") or data.get("picture_medium")
+        items = [
+            item
+            for track in tracks[:MAX_SPOTIFY_TRACKS]
+            if (
+                item := deezer_track_to_item(
+                    track,
+                    requester,
+                    requester_avatar_url,
+                    fallback_thumbnail=thumbnail,
+                )
+            )
+        ]
+        return items
+
+    if kind == "artist":
+        data = http_get_json(
+            f"https://api.deezer.com/artist/{deezer_id}/top",
+            params={"limit": min(MAX_SPOTIFY_TRACKS, 100)},
+        )
+        tracks = data.get("data", [])
+        return [
+            item
+            for track in tracks
+            if (item := deezer_track_to_item(track, requester, requester_avatar_url))
+        ]
+
+    raise RuntimeError("That Deezer URL type is not supported yet.")
+
+
+async def deezer_items(
+    url: str,
+    requester: str,
+    requester_avatar_url: str | None,
+) -> list[QueueItem]:
+    return await asyncio.to_thread(
+        deezer_items_sync,
+        url,
+        requester,
+        requester_avatar_url,
+    )
+
+
+def apple_artwork_url(value: str | None) -> str | None:
+    if not value:
+        return None
+    return re.sub(r"/\d+x\d+bb\.", "/600x600bb.", value)
+
+
+def apple_song_to_item(
+    song: dict[str, Any],
+    requester: str,
+    requester_avatar_url: str | None,
+) -> QueueItem | None:
+    return metadata_to_queue_item(
+        title=song.get("trackName") or "",
+        artist=song.get("artistName"),
+        requester=requester,
+        requester_avatar_url=requester_avatar_url,
+        webpage_url=song.get("trackViewUrl") or song.get("collectionViewUrl"),
+        duration=(
+            int(song["trackTimeMillis"]) / 1000
+            if song.get("trackTimeMillis") is not None
+            else None
+        ),
+        thumbnail=apple_artwork_url(song.get("artworkUrl100")),
+    )
+
+
+def apple_music_lookup_ids(url: str) -> tuple[str | None, str | None]:
+    parsed = urlparse(url)
+    query = parse_qs(parsed.query)
+    track_id = (query.get("i") or [None])[0]
+    path_ids = re.findall(r"/(\d+)(?:[/?#]|$)", parsed.path)
+    page_id = path_ids[-1] if path_ids else None
+
+    if "/song/" in parsed.path and not track_id:
+        track_id = page_id
+    album_id = page_id if "/album/" in parsed.path else None
+    return track_id, album_id
+
+
+def apple_music_items_sync(
+    url: str,
+    requester: str,
+    requester_avatar_url: str | None,
+) -> list[QueueItem]:
+    track_id, album_id = apple_music_lookup_ids(url)
+    lookup_id = track_id or album_id
+    if not lookup_id:
+        raise RuntimeError("That Apple Music URL type is not supported yet.")
+
+    data = http_get_json(
+        "https://itunes.apple.com/lookup",
+        params={
+            "id": lookup_id,
+            "entity": "song",
+            "limit": min(MAX_SPOTIFY_TRACKS, 200),
+        },
+    )
+    songs = [
+        result
+        for result in data.get("results", [])
+        if result.get("wrapperType") == "track"
+    ]
+    if track_id:
+        songs = [song for song in songs if str(song.get("trackId")) == str(track_id)]
+    return [
+        item
+        for song in songs[:MAX_SPOTIFY_TRACKS]
+        if (item := apple_song_to_item(song, requester, requester_avatar_url))
+    ]
+
+
+async def apple_music_items(
+    url: str,
+    requester: str,
+    requester_avatar_url: str | None,
+) -> list[QueueItem]:
+    return await asyncio.to_thread(
+        apple_music_items_sync,
+        url,
+        requester,
+        requester_avatar_url,
+    )
+
+
+def scraped_music_item_sync(
+    url: str,
+    requester: str,
+    requester_avatar_url: str | None,
+    *,
+    provider: str,
+) -> list[QueueItem]:
+    html = http_get_text(url)
+    title: str | None = None
+    artist: str | None = None
+    thumbnail: str | None = None
+
+    for raw_json_ld in iter_json_ld(html):
+        for entry in flatten_json_ld(raw_json_ld):
+            entry_type = entry.get("@type")
+            if isinstance(entry_type, list):
+                entry_types = {str(item).lower() for item in entry_type}
+            else:
+                entry_types = {str(entry_type).lower()} if entry_type else set()
+            if not entry_types & {"musicrecording", "song", "musicalbum"}:
+                continue
+            title = title or json_ld_text(entry.get("name"))
+            artist = artist or json_ld_text(
+                entry.get("byArtist") or entry.get("artist")
+            )
+            image = entry.get("image")
+            thumbnail = thumbnail or json_ld_text(image)
+            if title:
+                break
+        if title:
+            break
+
+    title = title or first_meta_content(html, "og:title", "twitter:title")
+    thumbnail = thumbnail or first_meta_content(html, "og:image", "twitter:image")
+    if not title:
+        title = first_html_title(html)
+    if not title:
+        raise RuntimeError(f"Could not read metadata from that {provider} URL.")
+
+    if not artist:
+        title, artist = split_title_artist_from_page(title, provider)
+    else:
+        title = clean_provider_title(title, provider)
+
+    item = metadata_to_queue_item(
+        title=title,
+        artist=artist,
+        requester=requester,
+        requester_avatar_url=requester_avatar_url,
+        webpage_url=url,
+        thumbnail=thumbnail,
+    )
+    return [item] if item else []
+
+
+async def scraped_music_items(
+    url: str,
+    requester: str,
+    requester_avatar_url: str | None,
+    *,
+    provider: str,
+) -> list[QueueItem]:
+    return await asyncio.to_thread(
+        scraped_music_item_sync,
+        url,
+        requester,
+        requester_avatar_url,
+        provider=provider,
+    )
+
+
+def iter_embedded_json(html: str) -> list[Any]:
+    values: list[Any] = []
+
+    for match in re.finditer(
+        r"data-a-state\s*=\s*([\"'])(.*?)\1",
+        html,
+        flags=re.IGNORECASE | re.S,
+    ):
+        raw_json = unescape(match.group(2)).strip()
+        if not raw_json:
+            continue
+        try:
+            values.append(json.loads(raw_json))
+        except json.JSONDecodeError:
+            continue
+
+    for match in re.finditer(
+        r"<script\b[^>]*>(.*?)</script>",
+        html,
+        flags=re.IGNORECASE | re.S,
+    ):
+        script = unescape(match.group(1)).strip()
+        if not script:
+            continue
+
+        try:
+            values.append(json.loads(script))
+            continue
+        except json.JSONDecodeError:
+            pass
+
+        for parse_match in re.finditer(
+            r"JSON\.parse\((?P<quoted>\"(?:\\.|[^\"])*\"|'(?:\\.|[^'])*')\)",
+            script,
+            flags=re.S,
+        ):
+            try:
+                decoded = json.loads(parse_match.group("quoted"))
+                values.append(json.loads(decoded))
+            except (TypeError, json.JSONDecodeError):
+                continue
+
+    return values
+
+
+def walk_json(value: Any) -> list[Any]:
+    values = [value]
+    if isinstance(value, dict):
+        for child in value.values():
+            values.extend(walk_json(child))
+    elif isinstance(value, list):
+        for child in value:
+            values.extend(walk_json(child))
+    return values
+
+
+def first_nested_text(value: Any, keys: set[str]) -> str | None:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key.lower() in keys:
+                text = json_ld_text(child)
+                if text:
+                    return sanitize_query(text)
+    return None
+
+
+def first_nested_url(value: Any, keys: set[str]) -> str | None:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key.lower() not in keys:
+                continue
+            if isinstance(child, str) and child.startswith(("http://", "https://")):
+                return child
+            if isinstance(child, dict):
+                text = first_nested_url(child, keys | {"url"})
+                if text:
+                    return text
+            if isinstance(child, list):
+                for entry in child:
+                    text = first_nested_url(entry, keys | {"url"})
+                    if text:
+                        return text
+    return None
+
+
+def first_nested_duration(value: Any) -> int | None:
+    if not isinstance(value, dict):
+        return None
+    for key, child in value.items():
+        lowered = key.lower()
+        if lowered in {"duration", "durationseconds", "durationinseconds"}:
+            try:
+                return int(float(child))
+            except (TypeError, ValueError):
+                continue
+        if lowered in {"durationms", "durationmillis", "durationmilliseconds"}:
+            try:
+                return int(float(child) / 1000)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def amazon_track_candidates(html: str) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    seen: set[tuple[str, str | None]] = set()
+    json_values = iter_json_ld(html) + iter_embedded_json(html)
+
+    for root in json_values:
+        for value in walk_json(root):
+            if not isinstance(value, dict):
+                continue
+
+            item_type = str(
+                value.get("@type")
+                or value.get("type")
+                or value.get("entityType")
+                or value.get("contentType")
+                or ""
+            ).lower()
+            title = first_nested_text(
+                value,
+                {
+                    "tracktitle",
+                    "songtitle",
+                    "titlename",
+                    "title",
+                    "name",
+                },
+            )
+            artist = first_nested_text(
+                value,
+                {
+                    "artistname",
+                    "primaryartistname",
+                    "artistdisplayname",
+                    "artist",
+                    "artists",
+                    "byartist",
+                },
+            )
+            if not title or not artist:
+                continue
+
+            looks_like_track = (
+                "track" in item_type
+                or "song" in item_type
+                or any(
+                    key.lower()
+                    in {"trackasin", "tracktitle", "songtitle", "durationms"}
+                    for key in value.keys()
+                )
+            )
+            if not looks_like_track:
+                continue
+
+            key = (normalize_artist_match(title), normalize_artist_match(artist))
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(
+                {
+                    "title": title,
+                    "artist": artist,
+                    "duration": first_nested_duration(value),
+                    "thumbnail": first_nested_url(
+                        value,
+                        {
+                            "image",
+                            "imageurl",
+                            "albumart",
+                            "albumarturl",
+                            "coverart",
+                            "coverarturl",
+                            "artwork",
+                            "url",
+                        },
+                    ),
+                }
+            )
+
+    return candidates
+
+
+def amazon_page_kind(url: str) -> str:
+    parsed = urlparse(url)
+    path = parsed.path.lower()
+    if "/playlists/" in path:
+        return "playlist"
+    if parse_qs(parsed.query).get("trackAsin"):
+        return "track"
+    if "/tracks/" in path:
+        return "track"
+    if "/albums/" in path:
+        return "album"
+    return "track"
+
+
+def amazon_web_api_endpoint(host: str) -> str:
+    if host.endswith(".co.uk") or host.endswith(".de") or host.endswith(".fr"):
+        return "https://eu.web.skill.music.a2z.com/api/showHome"
+    return "https://na.web.skill.music.a2z.com/api/showHome"
+
+
+def amazon_config_url(url: str) -> str:
+    parsed = urlparse(url)
+    return parsed._replace(path="/config.json", params="", fragment="").geturl()
+
+
+def amazon_deeplink(url: str) -> str:
+    parsed = urlparse(url)
+    query = parse_qs(parsed.query)
+    kept_query: list[str] = []
+    if query.get("trackAsin"):
+        kept_query.append(f"trackAsin={query['trackAsin'][0]}")
+    return parsed.path + (f"?{'&'.join(kept_query)}" if kept_query else "")
+
+
+def amazon_currency_for_host(host: str) -> str:
+    if host.endswith(".co.uk"):
+        return "GBP"
+    if host.endswith(".de") or host.endswith(".fr"):
+        return "EUR"
+    return "USD"
+
+
+def amazon_show_home_json(url: str) -> dict[str, Any]:
+    parsed = urlparse(url)
+    config = http_get_json(amazon_config_url(url))
+    csrf = config.get("csrf") or {}
+    host = parsed.netloc
+    user_agent = REQUEST_HEADERS["User-Agent"]
+    headers_payload = {
+        "x-amzn-authentication": json.dumps(
+            {
+                "interface": "ClientAuthenticationInterface.v1_0.ClientTokenElement",
+                "accessToken": config.get("accessToken", ""),
+            }
+        ),
+        "x-amzn-device-model": "WEBPLAYER",
+        "x-amzn-device-width": "1920",
+        "x-amzn-device-family": "WebPlayer",
+        "x-amzn-device-id": config.get("deviceId", ""),
+        "x-amzn-user-agent": user_agent,
+        "x-amzn-session-id": config.get("sessionId", ""),
+        "x-amzn-device-height": "1080",
+        "x-amzn-request-id": str(uuid.uuid4()),
+        "x-amzn-device-language": config.get("displayLanguage", "en_GB"),
+        "x-amzn-currency-of-preference": amazon_currency_for_host(host),
+        "x-amzn-os-version": "1.0",
+        "x-amzn-application-version": config.get("version", "1.0.0"),
+        "x-amzn-device-time-zone": os.getenv("TZ", "Europe/London"),
+        "x-amzn-timestamp": str(int(time.time() * 1000)),
+        "x-amzn-csrf": json.dumps(
+            {
+                "interface": "CSRFInterface.v1_0.CSRFHeaderElement",
+                "token": csrf.get("token", ""),
+                "timestamp": csrf.get("ts", ""),
+                "rndNonce": csrf.get("rnd", ""),
+            }
+        ),
+        "x-amzn-music-domain": host,
+        "x-amzn-referer": "",
+        "x-amzn-affiliate-tags": "",
+        "x-amzn-ref-marker": (config.get("metricsContext") or {}).get("refMarker", ""),
+        "x-amzn-page-url": url,
+        "x-amzn-weblab-id-overrides": "",
+        "x-amzn-video-player-token": "",
+        "x-amzn-feature-flags": "",
+        "x-amzn-has-profile-id": "",
+        "x-amzn-age-band": "",
+    }
+    body = {
+        "deeplink": json.dumps(
+            {
+                "interface": "DeeplinkInterface.v1_0.DeeplinkClientInformation",
+                "deeplink": amazon_deeplink(url),
+            }
+        ),
+        "headers": json.dumps(headers_payload),
+    }
+    response = requests.post(
+        amazon_web_api_endpoint(host),
+        headers={
+            **REQUEST_HEADERS,
+            "Accept": "application/json,text/plain,*/*",
+            "Content-Type": "application/json",
+            "Origin": f"{parsed.scheme}://{host}",
+            "Referer": f"{parsed.scheme}://{host}/",
+        },
+        json=body,
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def amazon_seo_artist(value: Any) -> str | None:
+    titles: list[str] = []
+    for item in walk_json(value):
+        if not isinstance(item, dict):
+            continue
+        if item.get("interface") == "Web.PageInterface.v1_0.SEOHeadLDJSONScriptElement":
+            raw = item.get("innerHTML")
+            if not isinstance(raw, str):
+                continue
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            data_type = str(data.get("@type") or "").lower()
+            if data_type not in {"musicalbum", "musicrecording", "song"}:
+                continue
+            artist = json_ld_text(data.get("byArtist") or data.get("artist"))
+            if artist:
+                return sanitize_query(artist)
+
+        title = item.get("title")
+        if isinstance(title, str):
+            titles.append(title)
+
+    for title in titles:
+        match = re.match(
+            r"^Play\s+.+?\s+by\s+(.+?)\s+on\s+Amazon Music",
+            title,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            return sanitize_query(match.group(1))
+    return None
+
+
+def amazon_response_tracks(value: Any, page_kind: str) -> list[dict[str, Any]]:
+    fallback_artist = amazon_seo_artist(value)
+    tracks: list[dict[str, Any]] = []
+    seen: set[tuple[str, str | None, str | None]] = set()
+    row_interfaces = {
+        "Web.TemplatesInterface.v1_0.Touch.WidgetsInterface.VisualRowItemElement",
+        "Web.TemplatesInterface.v1_0.Touch.WidgetsInterface.DescriptiveRowItemElement",
+    }
+
+    for item in walk_json(value):
+        if not isinstance(item, dict) or item.get("interface") not in row_interfaces:
+            continue
+        title = sanitize_query(item.get("primaryText") or "")
+        if not title:
+            continue
+
+        deeplink = ""
+        primary_link = item.get("primaryLink") or item.get("primaryTextLink")
+        if isinstance(primary_link, dict):
+            deeplink = primary_link.get("deeplink") or ""
+        if not deeplink and page_kind in {"playlist", "album"}:
+            continue
+
+        artist = sanitize_query(item.get("secondaryText1") or fallback_artist or "")
+        if not artist:
+            continue
+
+        duration = parse_duration_value(
+            item.get("secondaryText3") or item.get("duration")
+        )
+        key = (normalize_artist_match(title), normalize_artist_match(artist), deeplink)
+        if key in seen:
+            continue
+        seen.add(key)
+        tracks.append(
+            {
+                "title": title,
+                "artist": artist,
+                "duration": duration,
+                "thumbnail": first_nested_url(
+                    item,
+                    {
+                        "image",
+                        "imageurl",
+                        "albumart",
+                        "albumarturl",
+                        "coverart",
+                        "coverarturl",
+                        "artwork",
+                        "url",
+                    },
+                ),
+            }
+        )
+
+    return tracks
+
+
+def amazon_music_items_sync(
+    url: str,
+    requester: str,
+    requester_avatar_url: str | None,
+) -> list[QueueItem]:
+    parsed = urlparse(url)
+    kind = amazon_page_kind(url)
+    candidates: list[dict[str, Any]] = []
+
+    try:
+        candidates = amazon_response_tracks(amazon_show_home_json(url), kind)
+    except Exception as exc:
+        logger.warning("Amazon Music API metadata lookup failed: %s", exc)
+
+    if not candidates:
+        response = http_get_response(url)
+        html = response.text
+        candidates = amazon_track_candidates(html)
+
+    if candidates:
+        selected = (
+            candidates[:MAX_SPOTIFY_TRACKS]
+            if kind in {"album", "playlist"}
+            else candidates[:1]
+        )
+        items = [
+            item
+            for candidate in selected
+            if (
+                item := metadata_to_queue_item(
+                    title=candidate["title"],
+                    artist=candidate.get("artist"),
+                    requester=requester,
+                    requester_avatar_url=requester_avatar_url,
+                    webpage_url=url,
+                    duration=candidate.get("duration"),
+                    thumbnail=candidate.get("thumbnail"),
+                )
+            )
+        ]
+        if items:
+            return items
+
+    # Last-resort fallback for Amazon pages that hide their track list from HTML.
+    # This still lets single-track links resolve through title/artist page metadata.
+    return scraped_music_item_sync(
+        url,
+        requester,
+        requester_avatar_url,
+        provider="Amazon Music",
+    )
+
+
+async def amazon_music_items(
+    url: str,
+    requester: str,
+    requester_avatar_url: str | None,
+) -> list[QueueItem]:
+    return await asyncio.to_thread(
+        amazon_music_items_sync,
+        url,
+        requester,
+        requester_avatar_url,
+    )
+
+
 def entry_to_queue_item(
     entry: dict[str, Any],
     requester: str,
@@ -1148,9 +2081,22 @@ async def build_queue_items(
     query = sanitize_query(query)
     if is_spotify_url(query):
         return await spotify_items(query, requester, requester_avatar_url)
+    if is_deezer_url(query):
+        return await deezer_items(query, requester, requester_avatar_url)
+    if is_apple_music_url(query):
+        return await apple_music_items(query, requester, requester_avatar_url)
+    if is_tidal_url(query):
+        return await scraped_music_items(
+            query,
+            requester,
+            requester_avatar_url,
+            provider="TIDAL",
+        )
+    if is_amazon_music_url(query):
+        return await amazon_music_items(query, requester, requester_avatar_url)
 
     lookup = query if is_url(query) else f"ytsearch1:{query}"
-    info = await ytdl_extract(lookup, flat=is_url(query))
+    info = await ytdl_extract(lookup, flat=should_flat_extract_url(query))
 
     entries = info.get("entries")
     if entries:
@@ -1168,6 +2114,7 @@ async def build_queue_items(
 
 async def resolve_queue_item(item: QueueItem) -> Track:
     info = item.info
+    source_info = info or {}
     if not info or not info.get("url"):
         info = await ytdl_extract(item.query)
 
@@ -1183,11 +2130,11 @@ async def resolve_queue_item(item: QueueItem) -> Track:
         title=info.get("title") or item.title,
         stream_url=stream_url,
         webpage_url=info.get("webpage_url") or item.webpage_url,
-        duration=info.get("duration"),
+        duration=info.get("duration") or source_info.get("duration"),
         requester=item.requester,
         requester_avatar_url=item.requester_avatar_url,
         artist=artist,
-        thumbnail=info.get("thumbnail"),
+        thumbnail=info.get("thumbnail") or source_info.get("thumbnail"),
         uploader=info.get("uploader") or info.get("channel"),
         source_item=QueueItem(
             query=item.query,
@@ -1389,7 +2336,7 @@ async def help_command(ctx: commands.Context) -> None:
     embed = make_embed(
         "Simple Music Commands",
         (
-            f"`{prefix}play <query or link>` - queue a song, playlist, or Spotify link\n"
+            f"`{prefix}play <query or link>` - queue a song, playlist, or supported music-service link\n"
             f"`{prefix}pause` / `{prefix}resume` - control playback\n"
             f"`{prefix}skip` - skip the current song\n"
             f"`{prefix}stop` - clear the queue and leave voice\n"

@@ -1,18 +1,23 @@
 # VibeTunes, a simple Python Music Bot
 
 A simple Discord music bot with text commands only.
-Contains: `discord.py` voice playback, `yt-dlp` extraction, FFmpeg streaming, Spotify-to-search conversion through the Spotify developer API, and Genius lyrics.
+Contains: `discord.py` voice playback, `yt-dlp` extraction, FFmpeg streaming, music-service metadata resolvers, and Genius lyrics.
 
 ## Features
 
-- `!play <query or link>` queues YouTube/SoundCloud/direct `yt-dlp` sources.
-- `!play <spotify url>` converts Spotify tracks, albums, playlists, or artist
-  top tracks into playable searches.
-- `!pause`, `!resume`, `!skip`, `!stop`, `!disconnect`, `!queue`, `!now`,
-  `!loop`, `!shuffle` and `!volume`.
-- Embed responses throughout the bot, including an interactive paged queue.
-- `!lyrics [song]` uses Genius when `GENIUS_TOKEN` is configured.
+- `!play <query or link>` queues a song or playlist.
+- `!pause`, `!resume` pauses or resumes playback
+- `!skip` skips the current track
+- `!stop` stops playback and clears the queue
+- `!disconnect` disconnects the bot from the voice channe;
+- `!queue` shows the queue with interactive pages
+- `!now` shows current track information and timeline
+- `!loop` toggles looping for the current track
+- `!shuffle` shuffles the queue
+- `!volume` changes the bot playback volume between 0 and 200
+- `!lyrics [song]` fetches the lyrics for currently playing track or a given song
 - `!syncedlyrics [song]` uses `syncedlyrics` package for timestamped LRC lyrics.
+- Embed responses throughout the bot, including an interactive paged queue.
 
 
 ## Setup
@@ -61,7 +66,7 @@ python bot.py
 
 | Command | Description |
 | --- | --- |
-| `!play <url/query>` | Queue a song, playlist, search, or Spotify link. |
+| `!play <url/query>` | Queue a song, playlist, search, or supported music-service link. |
 | `!pause` / `!resume` | Pause or resume playback. |
 | `!skip` | Skip the current song. |
 | `!stop` | Clear the queue and leave voice. |
@@ -75,8 +80,7 @@ python bot.py
 
 ## Notes
 
-Spotify links do not play audio directly. 
-The bot uses Spotify metadata to search for an equivalent playable source, which is the same practical approach many Discord music bots use.
+Spotify, Deezer, Apple Music, Tidal, and Amazon Music links do not play protected service audio directly. The bot reads metadata from those links, then searches for an equivalent playable source.
 
 Use `!syncedlyrics` while music is playing to open a separate updating synced-lyrics embed. Leave `SYNCED_LYRICS_PROVIDERS` blank to let `syncedlyrics` try its default providers, or set a comma-separated list such as `Lrclib,NetEase`. If lyrics are consistently early or late, tune `SYNCED_LYRICS_OFFSET_SECONDS`.
 
