@@ -14,6 +14,7 @@ import uuid
 from collections import deque
 from dataclasses import dataclass
 from html import unescape
+from http.cookiejar import MozillaCookieJar
 from typing import Any, Deque
 from urllib.parse import parse_qs, urlparse
 
@@ -28,6 +29,11 @@ from dotenv import load_dotenv
 from spotipy.oauth2 import SpotifyClientCredentials
 
 try:
+    from spotify_scraper import SpotifyClient as SpotifyScraperClient
+except ImportError:
+    SpotifyScraperClient = None
+
+try:
     import syncedlyrics
 except ImportError:
     syncedlyrics = None
@@ -38,6 +44,12 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 COMMAND_PREFIX = os.getenv("COMMAND_PREFIX", "!").strip() or "!"
 MAX_SPOTIFY_TRACKS = int(os.getenv("MAX_SPOTIFY_TRACKS", "200"))
+SPOTIFY_SCRAPER_BROWSER = os.getenv("SPOTIFY_SCRAPER_BROWSER", "requests").strip() or "requests"
+SPOTIFY_COOKIE_FILE = os.getenv("SPOTIFY_COOKIE_FILE", "").strip()
+SPOTIFY_COOKIE_HEADER = os.getenv("SPOTIFY_COOKIE_HEADER", "").strip()
+SPOTIFY_SCRAPER_LOG_LEVEL = (
+    os.getenv("SPOTIFY_SCRAPER_LOG_LEVEL", "WARNING").strip() or "WARNING"
+)
 BOT_NAME = os.getenv("BOT_NAME", "VibeTunes").strip() or "VibeTunes"
 QUEUE_PAGE_SIZE = 10
 NOW_PLAYING_UPDATE_SECONDS = int(os.getenv("NOW_PLAYING_UPDATE_SECONDS", "1"))
@@ -115,7 +127,9 @@ def build_spotify_client() -> spotipy.Spotify | None:
     client_id = os.getenv("SPOTIFY_CLIENT_ID", "").strip()
     client_secret = os.getenv("SPOTIFY_CLIENT_SECRET", "").strip()
     if not client_id or not client_secret:
-        logger.warning("Spotify credentials are missing; Spotify links are disabled.")
+        logger.warning(
+            "Spotify API credentials are missing; falling back to SpotifyScraper only."
+        )
         return None
 
     try:
@@ -127,6 +141,71 @@ def build_spotify_client() -> spotipy.Spotify | None:
         )
     except Exception:
         logger.exception("Could not initialize Spotify client.")
+        return None
+
+
+def parse_cookie_header(value: str) -> dict[str, str]:
+    cookies: dict[str, str] = {}
+    for chunk in value.split(";"):
+        if "=" not in chunk:
+            continue
+        name, cookie_value = chunk.strip().split("=", 1)
+        if name:
+            cookies[name] = cookie_value
+    return cookies
+
+
+def load_cookie_file(path: str) -> dict[str, str]:
+    if not path:
+        return {}
+
+    jar = MozillaCookieJar()
+    try:
+        jar.load(path, ignore_discard=True, ignore_expires=True)
+    except (OSError, ValueError) as exc:
+        logger.warning("Could not read SPOTIFY_COOKIE_FILE %s: %s", path, exc)
+        return {}
+
+    return {
+        cookie.name: cookie.value
+        for cookie in jar
+        if "spotify" in (cookie.domain or "").lower()
+    }
+
+
+def spotify_scraper_cookies() -> dict[str, str]:
+    cookies = load_cookie_file(SPOTIFY_COOKIE_FILE)
+    if SPOTIFY_COOKIE_HEADER:
+        cookies.update(parse_cookie_header(SPOTIFY_COOKIE_HEADER))
+    return cookies
+
+
+def apply_spotify_scraper_auth(client: Any, cookies: dict[str, str]) -> None:
+    if not cookies:
+        return
+
+    browser = getattr(client, "browser", None)
+    requests_session = getattr(browser, "requests_session", None)
+    if requests_session is not None:
+        requests_session.cookies.update(cookies)
+
+
+def build_spotify_scraper_client() -> Any | None:
+    if SpotifyScraperClient is None:
+        logger.warning("SpotifyScraper is not installed; scraper fallback is disabled.")
+        return None
+
+    cookies = spotify_scraper_cookies()
+    try:
+        client = SpotifyScraperClient(
+            cookies=cookies or None,
+            browser_type=SPOTIFY_SCRAPER_BROWSER,
+            log_level=SPOTIFY_SCRAPER_LOG_LEVEL,
+        )
+        apply_spotify_scraper_auth(client, cookies)
+        return client
+    except Exception:
+        logger.exception("Could not initialize SpotifyScraper client.")
         return None
 
 
@@ -151,6 +230,7 @@ def build_genius_client() -> lyricsgenius.Genius | None:
 
 
 spotify_client = build_spotify_client()
+spotify_scraper_client = build_spotify_scraper_client()
 genius_client = build_genius_client()
 
 
@@ -243,8 +323,82 @@ def is_url(value: str) -> bool:
 
 
 def is_spotify_url(value: str) -> bool:
+    if value.startswith("spotify:"):
+        return True
     host = urlparse(value).netloc.lower()
     return "spotify.com" in host or host == "spotify.link"
+
+
+SPOTIFY_RESOURCE_TYPES = {"track", "album", "artist", "playlist"}
+
+
+def spotify_uri_parts(value: str) -> tuple[str, str] | None:
+    if not value.startswith("spotify:"):
+        return None
+    parts = value.split(":")
+    if len(parts) >= 3 and parts[1] in SPOTIFY_RESOURCE_TYPES and parts[2]:
+        return parts[1], parts[2]
+    return None
+
+
+def spotify_url_parts(value: str) -> list[str]:
+    parsed = urlparse(value)
+    parts = [part for part in parsed.path.strip("/").split("/") if part]
+    if parts and parts[0].startswith("intl-"):
+        parts = parts[1:]
+    return parts
+
+
+def spotify_resource_type(value: str) -> str | None:
+    uri_parts = spotify_uri_parts(value)
+    if uri_parts:
+        return uri_parts[0]
+
+    parts = spotify_url_parts(value)
+    if not parts:
+        return None
+    if parts[0] == "embed" and len(parts) >= 2:
+        parts = parts[1:]
+    if parts[0] == "user" and len(parts) >= 4 and parts[2] == "playlist":
+        return "playlist"
+    if parts[0] in SPOTIFY_RESOURCE_TYPES:
+        return parts[0]
+    return None
+
+
+def spotify_resource_id(value: str) -> str | None:
+    uri_parts = spotify_uri_parts(value)
+    if uri_parts:
+        return uri_parts[1]
+
+    parts = spotify_url_parts(value)
+    if not parts:
+        return None
+    if parts[0] == "embed" and len(parts) >= 3:
+        return parts[2]
+    if parts[0] == "user" and len(parts) >= 4 and parts[2] == "playlist":
+        return parts[3]
+    if parts[0] in SPOTIFY_RESOURCE_TYPES and len(parts) >= 2:
+        return parts[1]
+    return None
+
+
+def spotify_web_url(kind: str, spotify_id: str | None) -> str | None:
+    if not spotify_id:
+        return None
+    return f"https://open.spotify.com/{kind}/{spotify_id}"
+
+
+def normalize_spotify_url(value: str) -> str:
+    if urlparse(value).netloc.lower() == "spotify.link":
+        response = http_get_response(value)
+        value = response.url
+
+    kind = spotify_resource_type(value)
+    spotify_id = spotify_resource_id(value)
+    if kind and spotify_id:
+        return spotify_web_url(kind, spotify_id) or value
+    return value.split("?")[0]
 
 
 def is_soundcloud_url(value: str) -> bool:
@@ -1173,7 +1327,10 @@ def build_status_embed(ctx: commands.Context) -> discord.Embed:
             metric_line("Queue", count_text(len(player.queue) if player else 0, "track")),
             metric_line("Volume", f"{int((player.volume if player else 0.5) * 100)}%"),
             metric_line("Loop", feature_text(bool(player and player.loop_current))),
-            metric_line("Current", current_track_status_text(player.current if player else None)),
+            metric_line(
+                "Current",
+                current_track_status_text(player.current if player else None),
+            ),
         ],
         inline=False,
     )
@@ -1206,7 +1363,15 @@ def build_status_embed(ctx: commands.Context) -> discord.Embed:
                 "OS",
                 f"{platform.system()} {platform.release()} ({platform.machine()})",
             ),
-            metric_line("Spotify metadata", feature_text(spotify_client is not None)),
+            metric_line(
+                "SpotifyScraper",
+                feature_text(spotify_scraper_client is not None),
+            ),
+            metric_line("Spotify API", feature_text(spotify_client is not None)),
+            metric_line(
+                "Spotify cookies",
+                feature_text(bool(SPOTIFY_COOKIE_FILE or SPOTIFY_COOKIE_HEADER)),
+            ),
             metric_line("Genius lyrics", feature_text(genius_client is not None)),
             metric_line("Synced lyrics", feature_text(synced_lyrics_available())),
             metric_line(
@@ -1536,30 +1701,215 @@ def spotify_track_to_item(
     track: dict[str, Any],
     requester: str,
     requester_avatar_url: str | None,
+    *,
+    fallback_artist: str | None = None,
+    fallback_thumbnail: str | None = None,
+    source_url: str | None = None,
 ) -> QueueItem | None:
-    title = track.get("name")
-    artists = ", ".join(artist["name"] for artist in track.get("artists", []))
+    title = track.get("name") or track.get("title")
+    artists = spotify_artist_names(track.get("artists")) or fallback_artist
     if not title or not artists:
         return None
 
-    images = track.get("album", {}).get("images", [])
-    thumbnail = images[0]["url"] if images else None
+    album = track.get("album") if isinstance(track.get("album"), dict) else {}
+    thumbnail = (
+        spotify_image_url(album.get("images"))
+        or spotify_image_url(track.get("images"))
+        or fallback_thumbnail
+    )
     return metadata_to_queue_item(
         title=title,
         requester=requester,
         requester_avatar_url=requester_avatar_url,
         artist=artists,
-        webpage_url=track.get("external_urls", {}).get("spotify"),
-        duration=(
-            int(track["duration_ms"]) / 1000
-            if track.get("duration_ms") is not None
-            else None
-        ),
+        webpage_url=spotify_external_url(track, "track", source_url=source_url),
+        duration=spotify_duration_seconds(track),
         thumbnail=thumbnail,
     )
 
 
-def spotify_items_sync(
+def spotify_artist_names(artists: Any) -> str | None:
+    if isinstance(artists, str):
+        return sanitize_query(artists)
+
+    if isinstance(artists, dict):
+        name = artists.get("name") or artists.get("display_name")
+        return sanitize_query(str(name)) if name else None
+
+    if not isinstance(artists, list):
+        return None
+
+    names: list[str] = []
+    for artist in artists:
+        if isinstance(artist, dict):
+            name = artist.get("name") or artist.get("display_name")
+        else:
+            name = str(artist) if artist else None
+        if name:
+            names.append(sanitize_query(str(name)))
+    return ", ".join(name for name in names if name) or None
+
+
+def spotify_image_url(images: Any) -> str | None:
+    if isinstance(images, dict):
+        return images.get("url")
+
+    if not isinstance(images, list):
+        return None
+
+    for image in images:
+        if isinstance(image, dict) and image.get("url"):
+            return image["url"]
+        if isinstance(image, str) and image:
+            return image
+    return None
+
+
+def spotify_duration_seconds(track: dict[str, Any]) -> int | None:
+    raw_duration = (
+        track.get("duration_ms")
+        if track.get("duration_ms") is not None
+        else track.get("durationMs")
+    )
+    duration_is_ms = raw_duration is not None
+    if raw_duration is None:
+        raw_duration = track.get("duration")
+
+    if raw_duration is None:
+        return None
+
+    if isinstance(raw_duration, str):
+        parsed = parse_duration_value(raw_duration)
+        if parsed is not None:
+            return parsed
+
+    try:
+        duration = float(raw_duration)
+    except (TypeError, ValueError):
+        return None
+
+    if duration_is_ms or duration > 10000:
+        duration /= 1000
+    return int(duration)
+
+
+def spotify_external_url(
+    value: dict[str, Any],
+    kind: str,
+    *,
+    source_url: str | None = None,
+) -> str | None:
+    external_urls = value.get("external_urls")
+    if isinstance(external_urls, dict) and external_urls.get("spotify"):
+        return external_urls["spotify"]
+
+    if source_url and spotify_resource_type(source_url) == kind:
+        return normalize_spotify_url(source_url)
+
+    spotify_id = value.get("id")
+    if not spotify_id and isinstance(value.get("uri"), str):
+        uri_parts = spotify_uri_parts(value["uri"])
+        if uri_parts and uri_parts[0] == kind:
+            spotify_id = uri_parts[1]
+    return spotify_web_url(kind, str(spotify_id)) if spotify_id else None
+
+
+def spotify_track_source_url(track: dict[str, Any]) -> str | None:
+    return spotify_external_url(track, "track")
+
+
+def spotify_tracks_from_collection(value: dict[str, Any]) -> list[dict[str, Any]]:
+    tracks = value.get("tracks") or []
+    if isinstance(tracks, dict):
+        tracks = tracks.get("items") or []
+    if not isinstance(tracks, list):
+        return []
+
+    normalized: list[dict[str, Any]] = []
+    for entry in tracks:
+        if not isinstance(entry, dict):
+            continue
+        track = entry.get("track", entry)
+        if isinstance(track, dict) and track.get("name"):
+            normalized.append(track)
+    return normalized
+
+
+def spotify_scraper_collection_items(
+    collection: dict[str, Any],
+    requester: str,
+    requester_avatar_url: str | None,
+    *,
+    fallback_artist: str | None = None,
+) -> list[QueueItem]:
+    fallback_thumbnail = spotify_image_url(collection.get("images"))
+    items: list[QueueItem] = []
+    for track in spotify_tracks_from_collection(collection)[:MAX_SPOTIFY_TRACKS]:
+        item = spotify_track_to_item(
+            track,
+            requester,
+            requester_avatar_url,
+            fallback_artist=fallback_artist,
+            fallback_thumbnail=fallback_thumbnail,
+            source_url=spotify_track_source_url(track),
+        )
+        if item:
+            items.append(item)
+    return items
+
+
+def spotify_scraper_items_sync(
+    url: str,
+    requester: str,
+    requester_avatar_url: str | None,
+) -> list[QueueItem]:
+    if spotify_scraper_client is None:
+        raise RuntimeError("SpotifyScraper is not available.")
+
+    clean_url = normalize_spotify_url(url)
+    kind = spotify_resource_type(clean_url)
+
+    if kind == "track":
+        track = spotify_scraper_client.get_track_info(clean_url)
+        item = spotify_track_to_item(
+            track,
+            requester,
+            requester_avatar_url,
+            source_url=clean_url,
+        )
+        return [item] if item else []
+
+    if kind == "album":
+        album = spotify_scraper_client.get_album_info(clean_url)
+        return spotify_scraper_collection_items(
+            album,
+            requester,
+            requester_avatar_url,
+            fallback_artist=spotify_artist_names(album.get("artists")),
+        )
+
+    if kind == "playlist":
+        playlist = spotify_scraper_client.get_playlist_info(clean_url)
+        return spotify_scraper_collection_items(
+            playlist,
+            requester,
+            requester_avatar_url,
+        )
+
+    if kind == "artist":
+        artist = spotify_scraper_client.get_artist_info(clean_url)
+        tracks = {"tracks": artist.get("top_tracks", [])}
+        return spotify_scraper_collection_items(
+            tracks,
+            requester,
+            requester_avatar_url,
+            fallback_artist=spotify_artist_names(artist),
+        )
+
+    raise RuntimeError("That Spotify URL type is not supported yet.")
+
+
+def spotify_api_items_sync(
     url: str,
     requester: str,
     requester_avatar_url: str | None,
@@ -1569,19 +1919,33 @@ def spotify_items_sync(
             "Spotify support needs SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET."
         )
 
-    clean_url = url.split("?")[0]
+    clean_url = normalize_spotify_url(url)
     items: list[QueueItem] = []
 
     if "/track/" in clean_url:
         track = spotify_client.track(clean_url)
-        item = spotify_track_to_item(track, requester, requester_avatar_url)
+        item = spotify_track_to_item(
+            track,
+            requester,
+            requester_avatar_url,
+            source_url=clean_url,
+        )
         return [item] if item else []
 
     if "/album/" in clean_url:
-        page = spotify_client.album_tracks(clean_url, limit=50)
+        album = spotify_client.album(clean_url)
+        fallback_artist = spotify_artist_names(album.get("artists"))
+        fallback_thumbnail = spotify_image_url(album.get("images"))
+        page = album.get("tracks")
         while page and len(items) < MAX_SPOTIFY_TRACKS:
             for track in page.get("items", []):
-                item = spotify_track_to_item(track, requester, requester_avatar_url)
+                item = spotify_track_to_item(
+                    track,
+                    requester,
+                    requester_avatar_url,
+                    fallback_artist=fallback_artist,
+                    fallback_thumbnail=fallback_thumbnail,
+                )
                 if item:
                     items.append(item)
                 if len(items) >= MAX_SPOTIFY_TRACKS:
@@ -1617,6 +1981,40 @@ def spotify_items_sync(
         return items
 
     raise RuntimeError("That Spotify URL type is not supported yet.")
+
+
+def spotify_items_sync(
+    url: str,
+    requester: str,
+    requester_avatar_url: str | None,
+) -> list[QueueItem]:
+    errors: list[str] = []
+
+    if spotify_scraper_client is not None:
+        try:
+            items = spotify_scraper_items_sync(url, requester, requester_avatar_url)
+            if items:
+                return items
+            errors.append("SpotifyScraper did not return any playable tracks.")
+        except Exception as exc:
+            logger.warning("SpotifyScraper lookup failed for %s: %s", url, exc)
+            errors.append(str(exc))
+
+    if spotify_client is not None:
+        try:
+            items = spotify_api_items_sync(url, requester, requester_avatar_url)
+            if items:
+                return items
+            errors.append("Spotify API did not return any playable tracks.")
+        except Exception as exc:
+            logger.warning("Spotify API lookup failed for %s: %s", url, exc)
+            errors.append(str(exc))
+
+    if errors:
+        raise RuntimeError("Could not read that Spotify link: " + " / ".join(errors))
+    raise RuntimeError(
+        "Spotify support needs SpotifyScraper installed or Spotify API credentials."
+    )
 
 
 async def spotify_items(
@@ -2607,6 +3005,20 @@ async def play_next(guild_id: int) -> None:
         start_progress_task(guild_id)
 
 
+def log_playback_task_result(task: asyncio.Task) -> None:
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        logger.exception("Background playback task failed.")
+
+
+def start_playback_task(guild_id: int) -> None:
+    task = asyncio.create_task(play_next(guild_id))
+    task.add_done_callback(log_playback_task_result)
+
+
 @bot.event
 async def on_ready() -> None:
     await bot.change_presence(
@@ -2623,7 +3035,7 @@ async def on_ready() -> None:
 async def help_command(ctx: commands.Context) -> None:
     prefix = COMMAND_PREFIX
     embed = make_embed(
-        "Simple Music Commands",
+        "Music Commands",
         (
             f"`{prefix}play <query or link>` - queue a song, playlist, or supported music-service link\n"
             f"`{prefix}pause` / `{prefix}resume` - control playback\n"
@@ -2729,7 +3141,7 @@ async def play(ctx: commands.Context, *, query: str | None = None) -> None:
             requester=ctx.author,
         )
 
-    await play_next(ctx.guild.id)
+    start_playback_task(ctx.guild.id)
 
 
 @bot.command(name="pause")

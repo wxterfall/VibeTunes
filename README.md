@@ -46,6 +46,10 @@ SYNCED_LYRICS_CONTEXT_LINES=1
 SYNCED_LYRICS_OFFSET_SECONDS=0
 SPOTIFY_CLIENT_ID=your_spotify_client_id
 SPOTIFY_CLIENT_SECRET=your_spotify_client_secret
+SPOTIFY_SCRAPER_BROWSER=requests
+SPOTIFY_COOKIE_FILE=
+SPOTIFY_COOKIE_HEADER=
+SPOTIFY_SCRAPER_LOG_LEVEL=WARNING
 GENIUS_TOKEN=your_genius_token
 ```
 
@@ -83,6 +87,8 @@ python bot.py
 ## Notes
 
 Spotify, Deezer, Apple Music, Tidal, and Amazon Music links do not play protected service audio directly. The bot reads metadata from those links, then searches for an equivalent playable source.
+
+Spotify links are handled through SpotifyScraper first, with the Spotify API credentials used as a fallback when configured. Individual tracks, albums, public playlists, `spotify:...` URIs, `spotify.link` short links, and Spotify playlist-style curated mixes are supported. Personal/private playlists and personalized mixes can work when `SPOTIFY_COOKIE_FILE` points to an exported Spotify cookies.txt file or `SPOTIFY_COOKIE_HEADER` contains your Spotify browser cookie header.
 
 Use `!syncedlyrics` while music is playing to open a separate updating synced-lyrics embed. Leave `SYNCED_LYRICS_PROVIDERS` blank to let `syncedlyrics` try its default providers, or set a comma-separated list such as `Lrclib,NetEase`. If lyrics are consistently early or late, tune `SYNCED_LYRICS_OFFSET_SECONDS`.
 
