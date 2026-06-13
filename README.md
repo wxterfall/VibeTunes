@@ -15,6 +15,7 @@ Contains: `discord.py` voice playback, `yt-dlp` extraction, FFmpeg streaming, mu
 - `!loop` toggles looping for the current track
 - `!shuffle` shuffles the queue
 - `!volume` changes the bot playback volume between 0 and 200
+- `!status` shows detailed bot status and performance stats
 - `!lyrics [song]` fetches the lyrics for currently playing track or a given song
 - `!syncedlyrics [song]` uses `syncedlyrics` package for timestamped LRC lyrics.
 - Embed responses throughout the bot, including an interactive paged queue.
@@ -75,6 +76,7 @@ python bot.py
 | `!now` | Show the current song with an updating timeline. |
 | `!loop` | Toggle repeat for the current song. |
 | `!volume <0-200>` | Set playback volume. |
+| `!status` / `!stats` | Show detailed bot status and performance stats. |
 | `!lyrics [song]` | Fetch lyrics using Genius. |
 | `!syncedlyrics [song]` | Show synced lyrics for the current song or fetch timestamped lyrics for a query. |
 

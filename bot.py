@@ -5,8 +5,10 @@ import bisect
 import json
 import logging
 import os
+import platform
 import random
 import re
+import sys
 import time
 import uuid
 from collections import deque
@@ -17,6 +19,7 @@ from urllib.parse import parse_qs, urlparse
 
 import discord
 import lyricsgenius
+import psutil
 import requests
 import spotipy
 import yt_dlp
@@ -55,6 +58,18 @@ SYNCED_LYRICS_CONTEXT_LINES = max(
     int(os.getenv("SYNCED_LYRICS_CONTEXT_LINES", "1")),
 )
 SYNCED_LYRICS_OFFSET_SECONDS = float(os.getenv("SYNCED_LYRICS_OFFSET_SECONDS", "0"))
+BOT_STARTED_AT = time.monotonic()
+COMMANDS_HANDLED = 0
+COMMAND_ERRORS = 0
+TRACKS_QUEUED = 0
+TRACKS_STARTED = 0
+
+PROCESS = psutil.Process()
+try:
+    PROCESS.cpu_percent(interval=None)
+    psutil.cpu_percent(interval=None)
+except psutil.Error:
+    pass
 
 
 def env_color(name: str, fallback: str) -> int:
@@ -480,6 +495,57 @@ def duration_text(seconds: int | None) -> str:
     if hours:
         return f"{hours}:{minutes:02d}:{secs:02d}"
     return f"{minutes}:{secs:02d}"
+
+
+def uptime_text(seconds: float | int | None) -> str:
+    if seconds is None:
+        return "Unknown"
+
+    remaining = max(0, int(seconds))
+    days, remaining = divmod(remaining, 86400)
+    hours, remaining = divmod(remaining, 3600)
+    minutes, secs = divmod(remaining, 60)
+
+    parts: list[str] = []
+    if days:
+        parts.append(f"{days}d")
+    if hours or days:
+        parts.append(f"{hours}h")
+    if minutes or hours or days:
+        parts.append(f"{minutes}m")
+    parts.append(f"{secs}s")
+    return " ".join(parts)
+
+
+def format_bytes(size: int | float | None) -> str:
+    if size is None:
+        return "Unknown"
+
+    value = float(size)
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    for unit in units:
+        if abs(value) < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(value)} {unit}"
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} TiB"
+
+
+def percent_text(value: float | int | None) -> str:
+    if value is None:
+        return "Unknown"
+    return f"{float(value):.1f}%"
+
+
+def feature_text(enabled: bool) -> str:
+    return "On" if enabled else "Off"
+
+
+def count_text(value: int, singular: str, plural: str | None = None) -> str:
+    if value == 1:
+        return f"1 {singular}"
+    return f"{value:,} {plural or singular + 's'}"
 
 
 def split_artist_title(title: str) -> tuple[str, str | None]:
@@ -932,6 +998,226 @@ def build_synced_lyrics_embed(player: GuildPlayer, track: Track) -> discord.Embe
     set_track_requester_footer(embed, track)
     if track.thumbnail:
         embed.set_thumbnail(url=track.thumbnail)
+    return embed
+
+
+def metric_line(label: str, value: str) -> str:
+    return f"**{label}:** {value}"
+
+
+def add_metric_field(
+    embed: discord.Embed,
+    name: str,
+    lines: list[str],
+    *,
+    inline: bool = True,
+) -> None:
+    embed.add_field(
+        name=name,
+        value=clamp_embed_text("\n".join(lines) or "None", limit=1024),
+        inline=inline,
+    )
+
+
+def latency_status_text() -> str:
+    latency = bot.latency
+    if latency != latency or latency < 0:
+        return "Unknown"
+    return f"{latency * 1000:.0f} ms"
+
+
+def voice_client_state(voice_client: discord.VoiceClient | None) -> str:
+    if not voice_client or not voice_client.is_connected():
+        return "Disconnected"
+    if voice_client.is_playing():
+        return "Playing"
+    if voice_client.is_paused():
+        return "Paused"
+    return "Connected idle"
+
+
+def player_state_text(player: GuildPlayer | None) -> str:
+    if not player:
+        return "Disconnected"
+    return voice_client_state(player.voice_client)
+
+
+def current_track_status_text(track: Track | None) -> str:
+    if not track:
+        return "Nothing playing"
+
+    song, artist = display_song_artist(track.title, track.artist)
+    text = f"{song} by {artist}" if artist else song
+    return discord.utils.escape_markdown(clamp_embed_text(text, limit=180))
+
+
+def process_performance_lines() -> list[str]:
+    lines: list[str] = []
+
+    try:
+        memory = PROCESS.memory_info()
+        cpu_percent = PROCESS.cpu_percent(interval=None)
+        thread_count = PROCESS.num_threads()
+        lines.extend(
+            [
+                metric_line("Process CPU", percent_text(cpu_percent)),
+                metric_line("Memory RSS", format_bytes(memory.rss)),
+                metric_line("Memory virtual", format_bytes(memory.vms)),
+                metric_line("Threads", f"{thread_count:,}"),
+            ]
+        )
+        if hasattr(PROCESS, "num_handles"):
+            lines.append(metric_line("Handles", f"{PROCESS.num_handles():,}"))
+    except psutil.Error:
+        lines.append(metric_line("Process", "Unavailable"))
+
+    try:
+        host_memory = psutil.virtual_memory()
+        host_cpu = psutil.cpu_percent(interval=None)
+        lines.extend(
+            [
+                metric_line("Host CPU", percent_text(host_cpu)),
+                metric_line(
+                    "Host RAM",
+                    f"{percent_text(host_memory.percent)} used "
+                    f"({format_bytes(host_memory.used)} / {format_bytes(host_memory.total)})",
+                ),
+            ]
+        )
+    except psutil.Error:
+        lines.append(metric_line("Host", "Unavailable"))
+
+    try:
+        lines.append(metric_line("Async tasks", f"{len(asyncio.all_tasks()):,}"))
+    except RuntimeError:
+        pass
+
+    return lines
+
+
+def build_status_embed(ctx: commands.Context) -> discord.Embed:
+    bot_user = bot.user.name if bot.user else BOT_NAME
+    embed = make_embed(
+        f"{bot_user} Status",
+        "Detailed runtime and performance stats for this bot.",
+        color=PRIMARY_COLOR,
+        requester=ctx.author,
+    )
+    if bot.user:
+        embed.set_thumbnail(url=bot.user.display_avatar.url)
+
+    guild_count = len(bot.guilds)
+    member_count = sum(guild.member_count or 0 for guild in bot.guilds)
+    text_channel_count = sum(len(guild.text_channels) for guild in bot.guilds)
+    voice_channel_count = sum(len(guild.voice_channels) for guild in bot.guilds)
+    voice_clients = [
+        voice_client
+        for voice_client in bot.voice_clients
+        if voice_client and voice_client.is_connected()
+    ]
+    playing_count = sum(1 for voice_client in voice_clients if voice_client.is_playing())
+    paused_count = sum(1 for voice_client in voice_clients if voice_client.is_paused())
+    current_tracks = sum(1 for player in players.values() if player.current)
+    queued_tracks = sum(len(player.queue) for player in players.values())
+    looping_players = sum(1 for player in players.values() if player.loop_current)
+
+    add_metric_field(
+        embed,
+        "Bot",
+        [
+            metric_line("State", "Ready" if bot.is_ready() else "Starting"),
+            metric_line("Uptime", uptime_text(time.monotonic() - BOT_STARTED_AT)),
+            metric_line("Latency", latency_status_text()),
+            metric_line("Prefix", f"`{COMMAND_PREFIX}`"),
+            metric_line("Commands", f"{len(bot.commands):,} loaded"),
+        ],
+    )
+    add_metric_field(
+        embed,
+        "Reach",
+        [
+            metric_line("Servers", f"{guild_count:,}"),
+            metric_line("Members", f"{member_count:,}"),
+            metric_line("Cached users", f"{len(bot.users):,}"),
+            metric_line("Text channels", f"{text_channel_count:,}"),
+            metric_line("Voice channels", f"{voice_channel_count:,}"),
+        ],
+    )
+    add_metric_field(
+        embed,
+        "Music",
+        [
+            metric_line("Tracked servers", f"{len(players):,}"),
+            metric_line("Voice connections", f"{len(voice_clients):,}"),
+            metric_line("Playing", f"{playing_count:,}"),
+            metric_line("Paused", f"{paused_count:,}"),
+            metric_line("Current tracks", f"{current_tracks:,}"),
+            metric_line("Queued tracks", f"{queued_tracks:,}"),
+            metric_line("Looping", f"{looping_players:,}"),
+        ],
+    )
+
+    player = players.get(ctx.guild.id) if ctx.guild else None
+    voice_client = player.voice_client if player else None
+    voice_channel = (
+        discord.utils.escape_markdown(str(voice_client.channel))
+        if voice_client and voice_client.is_connected()
+        else "Not connected"
+    )
+    add_metric_field(
+        embed,
+        "This Server",
+        [
+            metric_line("State", player_state_text(player)),
+            metric_line("Voice", voice_channel),
+            metric_line("Queue", count_text(len(player.queue) if player else 0, "track")),
+            metric_line("Volume", f"{int((player.volume if player else 0.5) * 100)}%"),
+            metric_line("Loop", feature_text(bool(player and player.loop_current))),
+            metric_line("Current", current_track_status_text(player.current if player else None)),
+        ],
+        inline=False,
+    )
+    add_metric_field(
+        embed,
+        "Session",
+        [
+            metric_line("Commands handled", f"{COMMANDS_HANDLED:,}"),
+            metric_line("Command errors", f"{COMMAND_ERRORS:,}"),
+            metric_line("Tracks queued", f"{TRACKS_QUEUED:,}"),
+            metric_line("Tracks started", f"{TRACKS_STARTED:,}"),
+        ],
+    )
+    add_metric_field(
+        embed,
+        "Performance",
+        process_performance_lines(),
+        inline=False,
+    )
+    add_metric_field(
+        embed,
+        "Runtime",
+        [
+            metric_line(
+                "Python",
+                f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+            ),
+            metric_line("discord.py", discord.__version__),
+            metric_line(
+                "OS",
+                f"{platform.system()} {platform.release()} ({platform.machine()})",
+            ),
+            metric_line("Spotify metadata", feature_text(spotify_client is not None)),
+            metric_line("Genius lyrics", feature_text(genius_client is not None)),
+            metric_line("Synced lyrics", feature_text(synced_lyrics_available())),
+            metric_line(
+                "Idle disconnect",
+                duration_text(IDLE_DISCONNECT_SECONDS)
+                if IDLE_DISCONNECT_SECONDS > 0
+                else "Off",
+            ),
+        ],
+        inline=False,
+    )
     return embed
 
 
@@ -2215,6 +2501,8 @@ def on_track_done(guild_id: int, error: Exception | None) -> None:
 
 
 async def play_next(guild_id: int) -> None:
+    global TRACKS_STARTED
+
     player = player_for(guild_id)
     old_now_playing_messages: list[discord.Message] = []
     queue_finished_channel: discord.abc.Messageable | None = None
@@ -2303,6 +2591,7 @@ async def play_next(guild_id: int) -> None:
                 make_audio_source(player, track),
                 after=lambda error: on_track_done(guild_id, error),
             )
+            TRACKS_STARTED += 1
 
     if old_now_playing_messages:
         await delete_messages(old_now_playing_messages)
@@ -2346,11 +2635,17 @@ async def help_command(ctx: commands.Context) -> None:
             f"`{prefix}now` - show the current song\n"
             f"`{prefix}loop` - toggle repeat for the current song\n"
             f"`{prefix}volume <0-200>` - set playback volume\n"
+            f"`{prefix}status` - show detailed bot status and performance stats\n"
             f"`{prefix}lyrics [song]` - fetch lyrics with Genius\n"
             f"`{prefix}syncedlyrics [song]` - fetch synced lyrics"
         ),
     )
     await ctx.reply(embed=embed, mention_author=False)
+
+
+@bot.command(name="status", aliases=["stats", "botstatus"])
+async def status_command(ctx: commands.Context) -> None:
+    await ctx.reply(embed=build_status_embed(ctx), mention_author=False)
 
 
 @bot.command(name="join")
@@ -2367,6 +2662,8 @@ async def join(ctx: commands.Context) -> None:
 
 @bot.command(name="play", aliases=["p"])
 async def play(ctx: commands.Context, *, query: str | None = None) -> None:
+    global TRACKS_QUEUED
+
     if not ctx.guild:
         return
     if not query:
@@ -2414,6 +2711,7 @@ async def play(ctx: commands.Context, *, query: str | None = None) -> None:
         )
         return
 
+    TRACKS_QUEUED += len(items)
     player.queue.extend(items)
 
     if len(items) == 1:
@@ -2869,7 +3167,16 @@ async def lyrics(ctx: commands.Context, *, query: str | None = None) -> None:
 
 
 @bot.event
+async def on_command_completion(ctx: commands.Context) -> None:
+    global COMMANDS_HANDLED
+
+    COMMANDS_HANDLED += 1
+
+
+@bot.event
 async def on_command_error(ctx: commands.Context, error: commands.CommandError) -> None:
+    global COMMAND_ERRORS
+
     if isinstance(error, commands.CommandNotFound):
         command_name = ctx.invoked_with or "that command"
         await reply_embed(
@@ -2879,6 +3186,7 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError) 
             color=WARNING_COLOR,
         )
         return
+    COMMAND_ERRORS += 1
     if isinstance(error, commands.MissingRequiredArgument):
         await reply_embed(
             ctx,
